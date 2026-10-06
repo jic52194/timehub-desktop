@@ -1,0 +1,24 @@
+{
+  "name": "timehub-desktop",
+  "productName": "TimeHub",
+  "version": "1.0.0",
+  "description": "TimeHub desktop app (Electron wrapper for timehub.company) with native whole-computer idle.",
+  "main": "main.js",
+  "scripts": { "start": "electron .", "dist": "electron-builder --win" },
+  "devDependencies": { "electron": "^31.0.0", "electron-builder": "^24.13.3" },
+  "build": {
+    "appId": "com.mindtechb2b.timehub",
+    "productName": "TimeHub",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js"],
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }] },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "TimeHub",
+      "artifactName": "TimeHub-Setup.${ext}"
+    }
+  }
+}
