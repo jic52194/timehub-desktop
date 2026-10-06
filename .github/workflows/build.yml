@@ -15,7 +15,7 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npm run dist
+      - run: npm run dist -- --publish never
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
