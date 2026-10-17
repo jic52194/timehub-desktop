@@ -25,7 +25,7 @@ ipcRenderer.on('timehub:idle', (_e, payload) => {
 contextBridge.exposeInMainWorld('timehubNative', {
   isDesktop: true,
   platform: process.platform,
-  appVersion: '1.1.0',
+  appVersion: '1.2.0',
 
   // ----- idle (unchanged) -----
   getIdleSeconds: () => lastIdle.idleSeconds,

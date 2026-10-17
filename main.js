@@ -1,6 +1,10 @@
-// TimeHub desktop (Electron) — loads the live timehub.company app in a native
-// window, adds a system tray, auto-launch on login, and native whole-computer
-// idle detection fed to the web app (no browser permission prompt needed).
+// TimeHub desktop (Electron) — loads the live TimeHub web app in a native
+// window, adds a system tray, auto-launch on login, native whole-computer idle
+// detection fed to the web app, and auto-update from GitHub Releases.
+//
+// Host: defaults to the GitHub/Vercel app at app.timehub.company. Override at
+// launch with the TIMEHUB_URL env var (e.g. to point at a staging host) without
+// a rebuild.
 //
 // v1.1.0 adds two native capabilities for COMPLIANT, consent-based screen
 // monitoring. The native side only (a) grabs a single screen image when the web
@@ -14,8 +18,9 @@
 const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen } = require('electron');
 const path = require('path');
 
-const APP_URL = 'https://timehub.company';
+const APP_URL = process.env.TIMEHUB_URL || 'https://app.timehub.company';
 const IDLE_POLL_MS = 5000; // how often we report machine idle time to the web app
+const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000; // re-check for updates every 6 hours
 
 let mainWindow = null;
 let tray = null;
@@ -96,8 +101,11 @@ function createTray() {
   const icon = resolveIcon();
   tray = new Tray(icon || nativeImage.createEmpty());
   const menu = Menu.buildFromTemplate([
+    { label: `TimeHub v${app.getVersion()}`, enabled: false },
+    { type: 'separator' },
     { label: 'Open TimeHub', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
     { label: 'Reload', click: () => { if (mainWindow) mainWindow.reload(); } },
+    { label: 'Check for updates…', click: () => { try { if (autoUpdater) autoUpdater.checkForUpdatesAndNotify(); } catch (_) {} } },
     { type: 'separator' },
     { label: 'Start automatically on login', type: 'checkbox',
       checked: app.getLoginItemSettings().openAtLogin,
@@ -187,6 +195,30 @@ ipcMain.handle('timehub:live-border', (_e, on) => {
   } catch (_) { return false; }
 });
 
+// --- Auto-update (electron-updater → GitHub Releases) ------------------------
+// Checks on launch and every few hours. Downloads in the background and installs
+// on the next quit, so the fleet stays current without manual re-installs.
+// No-op in dev (unpackaged) and degrades gracefully if the module is missing.
+let autoUpdater = null;
+function setupAutoUpdate() {
+  if (!app.isPackaged) return;
+  try { ({ autoUpdater } = require('electron-updater')); } catch (_) { return; }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('update-downloaded', (info) => {
+    try {
+      if (tray) tray.setToolTip('TimeHub — update ready (installs on quit)');
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('timehub:update-ready', { version: info && info.version });
+      }
+    } catch (_) {}
+  });
+  autoUpdater.on('error', () => {}); // never surface update errors to the user
+  const check = () => { try { autoUpdater.checkForUpdates(); } catch (_) {} };
+  check();
+  setInterval(check, UPDATE_CHECK_MS);
+}
+
 app.whenReady().then(() => {
   if (!app.getLoginItemSettings().wasOpenedAtLogin && app.isPackaged) {
     try { app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true }); } catch (_) {}
@@ -194,6 +226,7 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   startIdleReporting();
+  setupAutoUpdate();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
