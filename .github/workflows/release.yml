@@ -1,0 +1,34 @@
+name: Release
+
+# Builds the Windows installer and publishes it (+ the auto-update feed
+# latest.yml) to a GitHub Release using the built-in GITHUB_TOKEN.
+# Trigger: push a tag like v1.2.0, or Actions tab -> Release -> Run workflow.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build and publish Windows installer
+        run: npm run publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
