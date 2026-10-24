@@ -2,7 +2,23 @@ name: Release
 
 # Builds the Windows installer and publishes it (+ the auto-update feed
 # latest.yml) to a GitHub Release using the built-in GITHUB_TOKEN.
-# Trigger: push a tag like v1.2.0, or Actions tab -> Release -> Run workflow.
+# Trigger: push a tag like v1.2.1, or Actions tab -> Release -> Run workflow.
+#
+# Code signing is optional. Unsigned builds succeed when CSC_LINK is unset.
+# Do not commit a certificate or a password. See README "Code signing".
+#
+# Authenticode — applied by electron-builder 24 when the secret is non-empty:
+#   secrets.CSC_LINK           base64 .pfx, https URL, or file path
+#   secrets.CSC_KEY_PASSWORD   password for that certificate
+#
+# Azure Trusted Signing — NOT applied by electron-builder 24.13.3:
+#   secrets.AZURE_TENANT_ID
+#   secrets.AZURE_CLIENT_ID
+#   secrets.AZURE_CLIENT_SECRET
+#   TODO(Jared): upgrade electron-builder to >= 25.1.6 and set win.azureSignOptions
+#   (publisherName, endpoint, certificateProfileName, codeSigningAccountName)
+#   before these secrets sign anything. They are forwarded only so the workflow
+#   can warn. Leaving them unset does not fail the build.
 
 on:
   push:
@@ -24,11 +40,41 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build and publish Windows installer
-        run: npm run publish
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # *_INPUT so a missing secret cannot become CSC_LINK="".
+          # electron-builder 24 treats an empty CSC_LINK as a certificate path and fails.
+          CSC_LINK_INPUT: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_INPUT: ${{ secrets.CSC_KEY_PASSWORD }}
+          AZURE_TENANT_ID_INPUT: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID_INPUT: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET_INPUT: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not [string]::IsNullOrWhiteSpace($env:CSC_LINK_INPUT)) {
+            $env:CSC_LINK = $env:CSC_LINK_INPUT
+            if (-not [string]::IsNullOrWhiteSpace($env:CSC_KEY_PASSWORD_INPUT)) {
+              $env:CSC_KEY_PASSWORD = $env:CSC_KEY_PASSWORD_INPUT
+            }
+            Write-Host "Authenticode signing enabled (CSC_LINK is set; value not printed)."
+          } else {
+            Write-Host "CSC_LINK not set. Building an unsigned installer."
+            Write-Host "TODO(Jared): add CSC_LINK and CSC_KEY_PASSWORD, or finish Azure Trusted Signing setup. See README."
+            # Avoid picking up an unrelated cert. Harmless when the store is empty.
+            $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
+          }
+          $azure = @($env:AZURE_TENANT_ID_INPUT, $env:AZURE_CLIENT_ID_INPUT, $env:AZURE_CLIENT_SECRET_INPUT) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          if ($azure.Count -gt 0) {
+            if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID_INPUT)) { $env:AZURE_TENANT_ID = $env:AZURE_TENANT_ID_INPUT }
+            if (-not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID_INPUT)) { $env:AZURE_CLIENT_ID = $env:AZURE_CLIENT_ID_INPUT }
+            if (-not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET_INPUT)) { $env:AZURE_CLIENT_SECRET = $env:AZURE_CLIENT_SECRET_INPUT }
+            Write-Host "::warning::Azure Trusted Signing env is set but electron-builder 24.13.3 does not use it. The installer is signed only when CSC_LINK is set. See README."
+          }
+          npm run publish

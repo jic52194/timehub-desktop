@@ -1,11 +1,12 @@
 {
   "name": "timehub-desktop",
   "productName": "TimeHub",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "TimeHub desktop (Electron wrapper for app.timehub.company) with native whole-computer idle, compliant consent-based screen monitoring, and auto-update.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "smoke": "node scripts/smoke.js",
     "dist": "electron-builder --win --publish never",
     "publish": "electron-builder --win --publish always"
   },
@@ -25,7 +26,13 @@
     "files": [
       "main.js",
       "preload.js",
-      "node_modules/**/*"
+      "node_modules/**/*",
+      "build/icon.ico",
+      "build/icon.png"
+    ],
+    "asarUnpack": [
+      "build/icon.ico",
+      "build/icon.png"
     ],
     "publish": [
       {
@@ -35,6 +42,7 @@
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",

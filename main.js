@@ -14,18 +14,41 @@
 // the upload. Capture only ever happens because the web app requested it, and
 // the web app only requests it when the company has monitoring enabled, the
 // person has accepted the notice, and they are clocked in and working.
+//
+// TODO(crash-reporting): nothing is wired. A vendor such as Sentry can be
+// initialized here later from an env DSN. Do not commit a DSN or a half-configured SDK.
 
 const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen } = require('electron');
+const fs = require('fs');
 const path = require('path');
 
 const APP_URL = process.env.TIMEHUB_URL || 'https://app.timehub.company';
 const IDLE_POLL_MS = 5000; // how often we report machine idle time to the web app
 const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000; // re-check for updates every 6 hours
+const UPDATER_LOG_MAX_BYTES = 256 * 1024;
 
 let mainWindow = null;
 let tray = null;
 let borderWindow = null;
 let isQuitting = false;
+let autoUpdater = null;
+let updateDownloaded = false;
+let pageReady = false;
+let pendingUpdate = null; // latest { channel, payload } to replay after a full load
+
+if (process.env.TIMEHUB_SELFTEST === '1') {
+  app.disableHardwareAcceleration();
+  if (process.platform === 'linux') app.commandLine.appendSwitch('no-sandbox');
+}
+
+// Synchronous on purpose: preload reads this before the page script runs and
+// exposes it as window.timehubNative.appVersion. The value is app.getVersion()
+// (package.json of this build), never a literal copied into preload.js.
+ipcMain.on('timehub:get-version', (event) => {
+  event.returnValue = app.getVersion();
+});
+
+ipcMain.handle('timehub:restart-to-update', () => installDownloadedUpdate());
 
 // --- Single instance: focus the existing window instead of opening a 2nd one ---
 const gotLock = app.requestSingleInstanceLock();
@@ -42,12 +65,112 @@ if (!gotLock) {
 }
 
 function resolveIcon() {
-  try {
-    const p = path.join(__dirname, 'build', 'icon.ico');
-    const img = nativeImage.createFromPath(p);
-    if (!img.isEmpty()) return img;
-  } catch (_) {}
+  const candidates = [
+    path.join(__dirname, 'build', 'icon.ico'),
+    path.join(__dirname, 'build', 'icon.png')
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const img = nativeImage.createFromPath(candidates[i]);
+      if (!img.isEmpty()) return img;
+    } catch (_) {}
+  }
   return undefined; // fall back to Electron default
+}
+
+function sendToRenderer(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send(channel, payload); } catch (_) {}
+}
+
+function publishUpdate(channel, payload) {
+  pendingUpdate = { channel: channel, payload: payload };
+  if (pageReady) sendToRenderer(channel, payload);
+}
+
+function logUpdater(level, message) {
+  const text = String(message || '');
+  const line = new Date().toISOString() + ' [' + level + '] ' + text;
+  if (level === 'error') console.error('[timehub-updater]', text);
+  else console.log('[timehub-updater]', text);
+  try {
+    if (!app.isReady()) return;
+    const dir = app.getPath('userData');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'updater.log');
+    if (fs.existsSync(file) && fs.statSync(file).size > UPDATER_LOG_MAX_BYTES) {
+      fs.unlinkSync(file);
+    }
+    fs.appendFileSync(file, line + '\n', 'utf8');
+  } catch (_) {}
+}
+
+function sanitizeUpdateMessage(value) {
+  let message = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!message) message = 'Update failed';
+  message = message.replace(/\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]+/gi, '[redacted]');
+  message = message.replace(/https?:\/\/\S+/gi, (url) => {
+    const cut = url.search(/[?#]/);
+    return cut === -1 ? url : url.slice(0, cut);
+  });
+  if (message.length > 400) message = message.slice(0, 400) + '...';
+  return message;
+}
+
+function setTrayTip(text) {
+  if (!tray) return;
+  const tip = String(text || 'TimeHub').replace(/\s+/g, ' ').trim().slice(0, 127);
+  try { tray.setToolTip(tip || 'TimeHub'); } catch (_) {}
+}
+
+function reportUpdateError(err) {
+  const raw = err && err.stack ? String(err.stack) : String(err && err.message ? err.message : err || 'Update failed');
+  const message = sanitizeUpdateMessage(err && err.message ? err.message : raw);
+  logUpdater('error', sanitizeUpdateMessage(raw));
+  if (updateDownloaded) {
+    setTrayTip('TimeHub — update ready (last check failed)');
+  } else {
+    setTrayTip('TimeHub — update failed: ' + message.slice(0, 80));
+  }
+  publishUpdate('timehub:update-error', { message: message });
+}
+
+function installDownloadedUpdate() {
+  if (!autoUpdater || !updateDownloaded) {
+    logUpdater('info', 'restart-to-update ignored: no downloaded update');
+    return false;
+  }
+  try {
+    // Silent install + relaunch. isForceRunAfter is honored only when silent.
+    autoUpdater.quitAndInstall(true, true);
+    return true;
+  } catch (err) {
+    reportUpdateError(err);
+    return false;
+  }
+}
+
+function refreshTrayMenu() {
+  if (!tray) return;
+  const items = [
+    { label: 'TimeHub v' + app.getVersion(), enabled: false }
+  ];
+  if (updateDownloaded) {
+    items.push({ label: 'Restart to update', click: () => installDownloadedUpdate() });
+  }
+  items.push(
+    { type: 'separator' },
+    { label: 'Open TimeHub', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    { label: 'Reload', click: () => { if (mainWindow) mainWindow.reload(); } },
+    { label: 'Check for updates…', click: () => checkForUpdates(true) },
+    { type: 'separator' },
+    { label: 'Start automatically on login', type: 'checkbox',
+      checked: app.getLoginItemSettings().openAtLogin,
+      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true }) },
+    { type: 'separator' },
+    { label: 'Quit TimeHub', click: () => { isQuitting = true; app.quit(); } }
+  );
+  tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
 function createWindow() {
@@ -66,6 +189,12 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false
     }
+  });
+
+  mainWindow.webContents.on('did-start-loading', () => { pageReady = false; });
+  mainWindow.webContents.on('did-finish-load', () => {
+    pageReady = true;
+    if (pendingUpdate) sendToRenderer(pendingUpdate.channel, pendingUpdate.payload);
   });
 
   mainWindow.loadURL(APP_URL);
@@ -100,21 +229,8 @@ function createWindow() {
 function createTray() {
   const icon = resolveIcon();
   tray = new Tray(icon || nativeImage.createEmpty());
-  const menu = Menu.buildFromTemplate([
-    { label: `TimeHub v${app.getVersion()}`, enabled: false },
-    { type: 'separator' },
-    { label: 'Open TimeHub', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
-    { label: 'Reload', click: () => { if (mainWindow) mainWindow.reload(); } },
-    { label: 'Check for updates…', click: () => { try { if (autoUpdater) autoUpdater.checkForUpdatesAndNotify(); } catch (_) {} } },
-    { type: 'separator' },
-    { label: 'Start automatically on login', type: 'checkbox',
-      checked: app.getLoginItemSettings().openAtLogin,
-      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true }) },
-    { type: 'separator' },
-    { label: 'Quit TimeHub', click: () => { isQuitting = true; app.quit(); } }
-  ]);
-  tray.setToolTip('TimeHub');
-  tray.setContextMenu(menu);
+  refreshTrayMenu();
+  setTrayTip('TimeHub');
   tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
 }
 
@@ -138,8 +254,8 @@ function startIdleReporting() {
 }
 
 // --- Screen monitoring: single-frame capture on request from the web app ------
-// Returns a JPEG data URL of the primary display. The web app decides whether to
-// call this at all; the native side just grabs the current screen.
+// Returns base64-encoded JPEG bytes (no data: prefix). The web app decides whether
+// to call this at all; the native side just grabs the current screen.
 ipcMain.handle('timehub:capture-screen', async (_e, opts) => {
   try {
     const primary = screen.getPrimaryDisplay();
@@ -197,29 +313,123 @@ ipcMain.handle('timehub:live-border', (_e, on) => {
 
 // --- Auto-update (electron-updater → GitHub Releases) ------------------------
 // Checks on launch and every few hours. Downloads in the background and installs
-// on the next quit, so the fleet stays current without manual re-installs.
-// No-op in dev (unpackaged) and degrades gracefully if the module is missing.
-let autoUpdater = null;
+// on the next quit, or immediately if the page / tray calls restart-to-update.
+// Failures are logged, shown on the tray tooltip, and forwarded to the page as
+// timehub:update-error. No-op in dev (unpackaged) and if the module is missing.
+function checkForUpdates(notify) {
+  if (!autoUpdater) {
+    if (notify) setTrayTip('TimeHub — updates run in the installed app');
+    logUpdater('info', 'update check skipped (unpackaged or updater unavailable)');
+    return;
+  }
+  try {
+    const pending = notify ? autoUpdater.checkForUpdatesAndNotify() : autoUpdater.checkForUpdates();
+    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+  } catch (err) {
+    reportUpdateError(err);
+  }
+}
+
 function setupAutoUpdate() {
   if (!app.isPackaged) return;
-  try { ({ autoUpdater } = require('electron-updater')); } catch (_) { return; }
+  try {
+    ({ autoUpdater } = require('electron-updater'));
+  } catch (err) {
+    logUpdater('error', 'electron-updater is not available: ' + (err && err.message ? err.message : err));
+    return;
+  }
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.on('update-downloaded', (info) => {
-    try {
-      if (tray) tray.setToolTip('TimeHub — update ready (installs on quit)');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('timehub:update-ready', { version: info && info.version });
-      }
-    } catch (_) {}
+  autoUpdater.on('checking-for-update', () => {
+    logUpdater('info', 'checking for updates');
   });
-  autoUpdater.on('error', () => {}); // never surface update errors to the user
-  const check = () => { try { autoUpdater.checkForUpdates(); } catch (_) {} };
-  check();
-  setInterval(check, UPDATE_CHECK_MS);
+  autoUpdater.on('update-available', (info) => {
+    const version = info && info.version ? String(info.version) : 'update';
+    logUpdater('info', 'update available ' + version);
+    setTrayTip('TimeHub — downloading ' + version);
+  });
+  autoUpdater.on('update-not-available', () => {
+    logUpdater('info', 'no update available');
+    if (!updateDownloaded) setTrayTip('TimeHub');
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    updateDownloaded = true;
+    const version = info && info.version ? String(info.version) : null;
+    logUpdater('info', 'update downloaded' + (version ? ' ' + version : ''));
+    setTrayTip('TimeHub — update ready (installs on quit)');
+    publishUpdate('timehub:update-ready', { version: version });
+    refreshTrayMenu();
+  });
+  autoUpdater.on('error', (err) => reportUpdateError(err));
+  checkForUpdates(false);
+  setInterval(() => checkForUpdates(false), UPDATE_CHECK_MS);
+}
+
+// Hidden-window check used by `npm run smoke`. Does not load the web app.
+function runSelfTest() {
+  const icon = resolveIcon();
+  if (!icon || icon.isEmpty()) {
+    console.error('[timehub-selftest] resolveIcon empty');
+    app.exit(1);
+    return;
+  }
+  const win = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  const fail = (msg) => {
+    console.error('[timehub-selftest]', msg);
+    try { win.destroy(); } catch (_) {}
+    app.exit(1);
+  };
+  const timer = setTimeout(() => fail('timed out'), 15000);
+  win.webContents.once('did-finish-load', async () => {
+    try {
+      const result = await win.webContents.executeJavaScript(
+        '({' +
+          'appVersion: window.timehubNative && window.timehubNative.appVersion,' +
+          'isDesktop: window.timehubNative && window.timehubNative.isDesktop,' +
+          'hasOnUpdateReady: typeof (window.timehubNative && window.timehubNative.onUpdateReady),' +
+          'hasOnUpdateError: typeof (window.timehubNative && window.timehubNative.onUpdateError),' +
+          'hasRestart: typeof (window.timehubNative && window.timehubNative.restartToUpdate),' +
+          'hasGetUpdateState: typeof (window.timehubNative && window.timehubNative.getUpdateState),' +
+          'state: window.timehubNative ? window.timehubNative.getUpdateState() : null' +
+        '})'
+      );
+      const expected = app.getVersion();
+      if (!result || result.appVersion !== expected) {
+        fail('appVersion ' + (result && result.appVersion) + ' !== ' + expected);
+        return;
+      }
+      if (result.isDesktop !== true) return fail('isDesktop');
+      if (result.hasOnUpdateReady !== 'function') return fail('onUpdateReady');
+      if (result.hasOnUpdateError !== 'function') return fail('onUpdateError');
+      if (result.hasRestart !== 'function') return fail('restartToUpdate');
+      if (result.hasGetUpdateState !== 'function') return fail('getUpdateState');
+      if (!result.state || result.state.status !== 'idle') return fail('update state not idle');
+      const restarted = await win.webContents.executeJavaScript('window.timehubNative.restartToUpdate()');
+      if (restarted !== false) return fail('restartToUpdate should be false before a download');
+      clearTimeout(timer);
+      console.log('[timehub-selftest] ok ' + expected);
+      win.destroy();
+      app.exit(0);
+    } catch (err) {
+      fail(err && err.stack ? err.stack : String(err));
+    }
+  });
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent('<!doctype html><title>selftest</title>'));
 }
 
 app.whenReady().then(() => {
+  if (!gotLock) return;
+  if (process.env.TIMEHUB_SELFTEST === '1') {
+    runSelfTest();
+    return;
+  }
   if (!app.getLoginItemSettings().wasOpenedAtLogin && app.isPackaged) {
     try { app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true }); } catch (_) {}
   }
