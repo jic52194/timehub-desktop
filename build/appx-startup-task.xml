@@ -1,0 +1,11 @@
+<!--
+  Store start-at-login. Inserted by electron-builder via appx.customExtensionsPath.
+  TaskId must match startup-task.js TASK_ID (TimeHub).
+  Enabled=true: a packaged desktop app starts at login without RequestEnableAsync.
+  Do not switch this to appx.addAutoLaunchExtension. electron-builder 24 hardcodes
+  that extension's task id to a different app's name.
+  Executable is app\TimeHub.exe because the packaged product filename is TimeHub.
+-->
+<desktop:Extension Category="windows.startupTask" Executable="app\TimeHub.exe" EntryPoint="Windows.FullTrustApplication">
+  <desktop:StartupTask TaskId="TimeHub" Enabled="true" DisplayName="TimeHub" />
+</desktop:Extension>
