@@ -1,6 +1,9 @@
 // TimeHub desktop (Electron) — loads the live TimeHub web app in a native
 // window, adds a system tray, auto-launch on login, native whole-computer idle
 // detection fed to the web app, and auto-update from GitHub Releases.
+// Microsoft Store (MSIX) builds skip electron-updater. The Store ships those
+// updates. Start-at-login on that build is the StartupTask in
+// build/appx-startup-task.xml, not a Run key.
 //
 // Host: defaults to the GitHub/Vercel app at app.timehub.company. Override at
 // launch with the TIMEHUB_URL env var (e.g. to point at a staging host) without
@@ -21,6 +24,9 @@
 const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const startupTask = require('./startup-task');
+
+const isWindowsStore = process.windowsStore === true;
 
 const APP_URL = process.env.TIMEHUB_URL || 'https://app.timehub.company';
 const IDLE_POLL_MS = 5000; // how often we report machine idle time to the web app
@@ -35,6 +41,7 @@ let autoUpdater = null;
 let updateDownloaded = false;
 let pageReady = false;
 let pendingUpdate = null; // latest { channel, payload } to replay after a full load
+let storeOpenAtLogin = true; // manifest StartupTask Enabled=true until a read returns
 
 if (process.env.TIMEHUB_SELFTEST === '1') {
   app.disableHardwareAcceleration();
@@ -46,6 +53,10 @@ if (process.env.TIMEHUB_SELFTEST === '1') {
 // (package.json of this build), never a literal copied into preload.js.
 ipcMain.on('timehub:get-version', (event) => {
   event.returnValue = app.getVersion();
+});
+
+ipcMain.on('timehub:get-host-info', (event) => {
+  event.returnValue = { windowsStore: isWindowsStore };
 });
 
 ipcMain.handle('timehub:restart-to-update', () => installDownloadedUpdate());
@@ -150,23 +161,45 @@ function installDownloadedUpdate() {
   }
 }
 
+function onStoreLogin(err, state) {
+  if (state) storeOpenAtLogin = startupTask.isOpenAtLoginState(state);
+  if (err) console.error('[timehub-startup]', err.message || err);
+  refreshTrayMenu();
+  if (state === 'disabledByUser' || state === 'disabledByPolicy') {
+    setTrayTip('TimeHub — start at login is off in Windows Startup settings');
+  }
+}
+
 function refreshTrayMenu() {
   if (!tray) return;
   const items = [
     { label: 'TimeHub v' + app.getVersion(), enabled: false }
   ];
-  if (updateDownloaded) {
+  if (!isWindowsStore && updateDownloaded) {
     items.push({ label: 'Restart to update', click: () => installDownloadedUpdate() });
   }
   items.push(
     { type: 'separator' },
     { label: 'Open TimeHub', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
-    { label: 'Reload', click: () => { if (mainWindow) mainWindow.reload(); } },
-    { label: 'Check for updates…', click: () => checkForUpdates(true) },
+    { label: 'Reload', click: () => { if (mainWindow) mainWindow.reload(); } }
+  );
+  // Store policy forbids electron-updater. The Store ships those updates.
+  if (!isWindowsStore) {
+    items.push({ label: 'Check for updates…', click: () => checkForUpdates(true) });
+  }
+  items.push(
     { type: 'separator' },
     { label: 'Start automatically on login', type: 'checkbox',
-      checked: app.getLoginItemSettings().openAtLogin,
-      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true }) },
+      checked: isWindowsStore ? storeOpenAtLogin : app.getLoginItemSettings().openAtLogin,
+      click: (item) => {
+        if (isWindowsStore) {
+          storeOpenAtLogin = !!item.checked;
+          refreshTrayMenu();
+          startupTask.runStartupTask(item.checked ? 'enable' : 'disable', onStoreLogin);
+          return;
+        }
+        app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true });
+      } },
     { type: 'separator' },
     { label: 'Quit TimeHub', click: () => { isQuitting = true; app.quit(); } }
   );
@@ -317,6 +350,10 @@ ipcMain.handle('timehub:live-border', (_e, on) => {
 // Failures are logged, shown on the tray tooltip, and forwarded to the page as
 // timehub:update-error. No-op in dev (unpackaged) and if the module is missing.
 function checkForUpdates(notify) {
+  if (isWindowsStore) {
+    logUpdater('info', 'update check skipped (Microsoft Store owns updates)');
+    return;
+  }
   if (!autoUpdater) {
     if (notify) setTrayTip('TimeHub — updates run in the installed app');
     logUpdater('info', 'update check skipped (unpackaged or updater unavailable)');
@@ -331,6 +368,10 @@ function checkForUpdates(notify) {
 }
 
 function setupAutoUpdate() {
+  if (isWindowsStore) {
+    logUpdater('info', 'update check skipped (Microsoft Store owns updates)');
+    return;
+  }
   if (!app.isPackaged) return;
   try {
     ({ autoUpdater } = require('electron-updater'));
@@ -397,7 +438,8 @@ function runSelfTest() {
           'hasOnUpdateError: typeof (window.timehubNative && window.timehubNative.onUpdateError),' +
           'hasRestart: typeof (window.timehubNative && window.timehubNative.restartToUpdate),' +
           'hasGetUpdateState: typeof (window.timehubNative && window.timehubNative.getUpdateState),' +
-          'state: window.timehubNative ? window.timehubNative.getUpdateState() : null' +
+          'state: window.timehubNative ? window.timehubNative.getUpdateState() : null,' +
+          'windowsStore: window.timehubNative && window.timehubNative.windowsStore' +
         '})'
       );
       const expected = app.getVersion();
@@ -411,6 +453,7 @@ function runSelfTest() {
       if (result.hasRestart !== 'function') return fail('restartToUpdate');
       if (result.hasGetUpdateState !== 'function') return fail('getUpdateState');
       if (!result.state || result.state.status !== 'idle') return fail('update state not idle');
+      if (result.windowsStore !== false) return fail('windowsStore');
       const restarted = await win.webContents.executeJavaScript('window.timehubNative.restartToUpdate()');
       if (restarted !== false) return fail('restartToUpdate should be false before a download');
       clearTimeout(timer);
@@ -430,11 +473,15 @@ app.whenReady().then(() => {
     runSelfTest();
     return;
   }
-  if (!app.getLoginItemSettings().wasOpenedAtLogin && app.isPackaged) {
+  // NSIS: a manual start turns the Run key back on. MSIX cannot use that API.
+  // The Store package's StartupTask is Enabled in the manifest, and the tray
+  // toggles it. A manual start must not override DisabledByUser.
+  if (!isWindowsStore && !app.getLoginItemSettings().wasOpenedAtLogin && app.isPackaged) {
     try { app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true }); } catch (_) {}
   }
   createWindow();
   createTray();
+  if (isWindowsStore) startupTask.runStartupTask('get', onStoreLogin);
   startIdleReporting();
   setupAutoUpdate();
 

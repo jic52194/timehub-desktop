@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Regenerate build/icon.png and build/icon.ico.
+"""Regenerate build/icon.png, build/icon.ico, and the Store tiles in build/appx/.
 
 Runtime and electron-builder use the committed files, not this script.
+Square tiles are resized from the 512px icon.png this script writes.
 Requires Pillow: python3 -m pip install pillow && python3 scripts/make-icon.py
 """
 
@@ -118,6 +119,40 @@ def draw(size):
     return img
 
 
+def square_logo(icon, size):
+    return icon.resize((size, size), Image.LANCZOS)
+
+
+def wide_logo(icon, width, height):
+    """Navy field, icon at the left, room on the right for the tile name."""
+    canvas = Image.new("RGBA", (width, height), NAVY)
+    side = max(1, int(height * 0.72))
+    glyph = icon.resize((side, side), Image.LANCZOS)
+    x = max(0, int(height * 0.14))
+    y = max(0, (height - side) // 2)
+    canvas.paste(glyph, (x, y), glyph)
+    return canvas
+
+
+def write_appx_tiles(icon):
+    appx = OUT / "appx"
+    appx.mkdir(parents=True, exist_ok=True)
+    tiles = {
+        "StoreLogo.png": square_logo(icon, 50),
+        "Square44x44Logo.png": square_logo(icon, 44),
+        "Square150x150Logo.png": square_logo(icon, 150),
+        "Wide310x150Logo.png": wide_logo(icon, 310, 150),
+        "LargeTile.png": square_logo(icon, 310),
+        "SmallTile.png": square_logo(icon, 71),
+        "BadgeLogo.png": square_logo(icon, 24),
+        "SplashScreen.png": wide_logo(icon, 620, 300),
+    }
+    for name, image in tiles.items():
+        dest = appx / name
+        image.save(dest, format="PNG")
+        print(f"wrote {dest} {image.size[0]}x{image.size[1]} ({dest.stat().st_size} bytes)")
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     images = [draw(size) for size in ICO_SIZES]
@@ -133,6 +168,7 @@ def main():
     )
     print(f"wrote {png_path} ({png_path.stat().st_size} bytes)")
     print(f"wrote {ico_path} ({ico_path.stat().st_size} bytes)")
+    write_appx_tiles(png)
 
 
 if __name__ == "__main__":

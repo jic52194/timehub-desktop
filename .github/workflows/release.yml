@@ -1,11 +1,15 @@
 name: Release
 
-# Builds the Windows installer and publishes it (+ the auto-update feed
-# latest.yml) to a GitHub Release using the built-in GITHUB_TOKEN.
+# Builds the Windows NSIS installer and the Store appx, and publishes both
+# to a GitHub Release using the built-in GITHUB_TOKEN. latest.yml lists only
+# the NSIS installer (appx.electronUpdaterAware is false). The Store package
+# is left unsigned so Partner Center can re-sign it; CSC_LINK is not required
+# for that artifact and is not applied to it.
 # Trigger: push a tag like v1.2.1, or Actions tab -> Release -> Run workflow.
 #
-# Code signing is optional. Unsigned builds succeed when CSC_LINK is unset.
-# Do not commit a certificate or a password. See README "Code signing".
+# Code signing is optional for NSIS. Unsigned builds succeed when CSC_LINK is unset.
+# Do not commit a certificate or a password. See README "Code signing"
+# and "Microsoft Store".
 #
 # Authenticode — applied by electron-builder 24 when the secret is non-empty:
 #   secrets.CSC_LINK           base64 .pfx, https URL, or file path

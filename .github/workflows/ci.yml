@@ -5,6 +5,8 @@ name: CI
 #
 # CSC_IDENTITY_AUTO_DISCOVERY=false keeps the PR build unsigned even if the
 # runner has an unrelated certificate. Do not set CSC_LINK here.
+# The Store appx is produced unsigned on purpose. Partner Center re-signs it.
+# scripts/sign-windows.js skips *.appx even if CSC_LINK is set on a release.
 
 on:
   pull_request:
@@ -36,5 +38,14 @@ jobs:
       - name: Syntax and bridge smoke test
         run: npm run smoke
 
-      - name: Build unsigned Windows installer
+      - name: Build unsigned NSIS installer and Store appx
         run: npm run dist
+
+      - name: Upload NSIS and Store packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/**/*.appx

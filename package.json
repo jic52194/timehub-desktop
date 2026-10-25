@@ -7,8 +7,8 @@
   "scripts": {
     "start": "electron .",
     "smoke": "node scripts/smoke.js",
-    "dist": "electron-builder --win --publish never",
-    "publish": "electron-builder --win --publish always"
+    "dist": "node scripts/build-win.js --publish never",
+    "publish": "node scripts/build-win.js --publish always"
   },
   "dependencies": {
     "electron-updater": "^6.3.9"
@@ -26,6 +26,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "startup-task.js",
       "node_modules/**/*",
       "build/icon.ico",
       "build/icon.png"
@@ -49,8 +50,29 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "appx",
+          "arch": [
+            "x64"
+          ]
         }
       ]
+    },
+    "appx": {
+      "identityName": "PLACEHOLDER.PartnerCenter.IdentityName",
+      "publisher": "CN=PLACEHOLDER-PARTNER-CENTER-PUBLISHER",
+      "publisherDisplayName": "PLACEHOLDER Publisher Display Name",
+      "applicationId": "TimeHub",
+      "displayName": "TimeHub",
+      "backgroundColor": "#123454",
+      "languages": [
+        "en-US"
+      ],
+      "showNameOnTiles": true,
+      "customExtensionsPath": "build/appx-startup-task.xml",
+      "electronUpdaterAware": false,
+      "artifactName": "TimeHub-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

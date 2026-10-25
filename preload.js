@@ -64,12 +64,24 @@ ipcRenderer.on('timehub:update-error', (_e, payload) => {
   notify(updateErrorListeners, detail);
 });
 
+function readHostInfo() {
+  try {
+    const info = ipcRenderer.sendSync('timehub:get-host-info');
+    if (info && typeof info === 'object') return info;
+  } catch (_) {}
+  return { windowsStore: false };
+}
+
 const appVersion = readAppVersion();
+const hostInfo = readHostInfo();
 
 contextBridge.exposeInMainWorld('timehubNative', {
   isDesktop: true,
   platform: process.platform,
   appVersion: appVersion,
+  // True when this process is the Microsoft Store / MSIX package.
+  // electron-updater does not run in that build; the Store ships updates.
+  windowsStore: hostInfo.windowsStore === true,
 
   // ----- idle (unchanged) -----
   getIdleSeconds: () => lastIdle.idleSeconds,
