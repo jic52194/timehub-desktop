@@ -18,7 +18,7 @@ function read(rel) {
   return fs.readFileSync(path.join(root, rel), 'utf8');
 }
 
-for (const file of ['main.js', 'preload.js', 'scripts/smoke.js']) {
+for (const file of ['main.js', 'preload.js', 'device-monitor.js', 'scripts/smoke.js', 'scripts/device-monitor.test.js']) {
   const result = spawnSync(process.execPath, ['--check', path.join(root, file)], { encoding: 'utf8' });
   if (result.status !== 0) {
     fail(file + ' failed node --check\n' + (result.stderr || result.stdout || ''));
@@ -29,6 +29,7 @@ const pkg = JSON.parse(read('package.json'));
 if (!/^\d+\.\d+\.\d+/.test(pkg.version)) fail('package.json version is not semver: ' + pkg.version);
 
 const files = (pkg.build && pkg.build.files) || [];
+if (files.indexOf('device-monitor.js') === -1) fail('build.files is missing device-monitor.js');
 const nodeModulesPattern = files.indexOf('node_modules/**/*');
 for (const rel of ['build/icon.ico', 'build/icon.png']) {
   const idx = files.indexOf(rel);
@@ -87,6 +88,27 @@ if (!ci.includes('npm ci') || !ci.includes('npm run smoke') || !ci.includes('npm
 if (!ci.includes('windows-latest')) fail('ci.yml should run on windows-latest');
 if (ci.includes('--publish always') || ci.includes('npm run publish')) {
   fail('ci.yml must not publish');
+}
+
+// USB / file-copy logging: off until the web app asks, main window only,
+// never reads contents.
+for (const token of ['timehub:device-monitoring', 'timehub:device-event', 'fromMainWindow(event)', 'stopDeviceMonitoring()']) {
+  if (!main.includes(token)) fail('main.js is missing ' + token);
+}
+if (/new DeviceMonitor\([^)]*\)[\s\S]{0,80}\.start\(\)/.test(main.split("ipcMain.handle('timehub:device-monitoring'")[0])) {
+  fail('device logging must start only from the timehub:device-monitoring handler');
+}
+const deviceMonitorSrc = read('device-monitor.js');
+if (/readFile|createReadStream|\.open\(/.test(deviceMonitorSrc)) {
+  fail('device-monitor.js must never read file contents');
+}
+for (const token of ['setDeviceMonitoring', 'onDeviceEvent', 'deviceMonitoringSupported']) {
+  if (!preload.includes(token)) fail('preload.js is missing ' + token);
+}
+{
+  const result = spawnSync(process.execPath, [path.join(root, 'scripts', 'device-monitor.test.js')], { encoding: 'utf8', timeout: 30000 });
+  if (result.status !== 0) fail('device-monitor test failed\n' + (result.stdout || '') + (result.stderr || ''));
+  else console.log((result.stdout || '').trim());
 }
 
 function canLaunchElectron() {

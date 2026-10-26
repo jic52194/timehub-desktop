@@ -1,8 +1,8 @@
 {
   "name": "timehub-desktop",
   "productName": "TimeHub",
-  "version": "1.2.1",
-  "description": "TimeHub desktop (Electron wrapper for app.timehub.company) with native whole-computer idle, compliant consent-based screen monitoring, and auto-update.",
+  "version": "1.3.0",
+  "description": "TimeHub desktop (Electron wrapper for app.timehub.company) with native whole-computer idle, compliant consent-based screen monitoring, USB drive and file-copy logging, and auto-update.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -26,6 +26,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "device-monitor.js",
       "node_modules/**/*",
       "build/icon.ico",
       "build/icon.png"

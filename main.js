@@ -21,6 +21,7 @@
 const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { DeviceMonitor } = require('./device-monitor');
 
 const APP_URL = process.env.TIMEHUB_URL || 'https://app.timehub.company';
 const IDLE_POLL_MS = 5000; // how often we report machine idle time to the web app
@@ -35,8 +36,14 @@ let autoUpdater = null;
 let updateDownloaded = false;
 let pageReady = false;
 let pendingUpdate = null; // latest { channel, payload } to replay after a full load
+let deviceMonitor = null; // USB / file-copy logging, on only while the web app asks
+const deviceQueue = []; // device events held while the page is (re)loading
+const DEVICE_QUEUE_MAX = 1000;
 
 if (process.env.TIMEHUB_SELFTEST === '1') {
+  // Own data folder, so the single-instance lock never collides with an
+  // installed TimeHub that is running on the same machine.
+  app.setPath('userData', path.join(require('os').tmpdir(), 'timehub-selftest-' + process.pid));
   app.disableHardwareAcceleration();
   if (process.platform === 'linux') app.commandLine.appendSwitch('no-sandbox');
 }
@@ -195,6 +202,7 @@ function createWindow() {
   mainWindow.webContents.on('did-finish-load', () => {
     pageReady = true;
     if (pendingUpdate) sendToRenderer(pendingUpdate.channel, pendingUpdate.payload);
+    flushDeviceQueue();
   });
 
   mainWindow.loadURL(APP_URL);
@@ -311,6 +319,66 @@ ipcMain.handle('timehub:live-border', (_e, on) => {
   } catch (_) { return false; }
 });
 
+// --- USB / removable drive and file-copy logging (added v1.3.0) ---------------
+// Off until the web app turns it on. The web app turns it on only when the
+// company has monitoring enabled and the person has accepted the current
+// monitoring notice (same rule as screenshots), and off again when that stops
+// being true or the person signs out. Events carry file names, types, sizes
+// and times only — never contents. The web app records them.
+function flushDeviceQueue() {
+  if (!pageReady) return;
+  while (deviceQueue.length) sendToRenderer('timehub:device-event', deviceQueue.shift());
+}
+
+function sendDeviceEvent(ev) {
+  deviceQueue.push(ev);
+  if (deviceQueue.length > DEVICE_QUEUE_MAX) deviceQueue.shift();
+  flushDeviceQueue();
+}
+
+function stopDeviceMonitoring() {
+  if (deviceMonitor) {
+    try { deviceMonitor.stop(); } catch (_) {}
+    deviceMonitor = null;
+  }
+  deviceQueue.length = 0;
+}
+
+function fromMainWindow(event) {
+  return !!mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents;
+}
+
+ipcMain.handle('timehub:device-monitoring', (event, on) => {
+  if (!fromMainWindow(event)) return { ok: false, active: false, reason: 'not-main-window' };
+  if (process.platform !== 'win32') return { ok: false, active: false, reason: 'unsupported-platform' };
+  if (!on) {
+    stopDeviceMonitoring();
+    return { ok: true, active: false };
+  }
+  if (!deviceMonitor) {
+    try {
+      let downloads = null;
+      try { downloads = app.getPath('downloads'); } catch (_) {}
+      deviceMonitor = new DeviceMonitor({
+        scriptDir: app.getPath('userData'),
+        folders: downloads ? [{ root: downloads, label: 'Downloads' }] : []
+      });
+      deviceMonitor.on('event', sendDeviceEvent);
+      deviceMonitor.on('error', (err) => console.warn('[timehub-devices]', err && err.message ? err.message : err));
+      deviceMonitor.start();
+    } catch (err) {
+      deviceMonitor = null;
+      return { ok: false, active: false, reason: String(err && err.message ? err.message : err).slice(0, 200) };
+    }
+  }
+  return { ok: true, active: true };
+});
+
+ipcMain.handle('timehub:removable-drives', (event) => {
+  if (!fromMainWindow(event) || !deviceMonitor) return [];
+  return deviceMonitor.drives();
+});
+
 // --- Auto-update (electron-updater → GitHub Releases) ------------------------
 // Checks on launch and every few hours. Downloads in the background and installs
 // on the next quit, or immediately if the page / tray calls restart-to-update.
@@ -397,6 +465,10 @@ function runSelfTest() {
           'hasOnUpdateError: typeof (window.timehubNative && window.timehubNative.onUpdateError),' +
           'hasRestart: typeof (window.timehubNative && window.timehubNative.restartToUpdate),' +
           'hasGetUpdateState: typeof (window.timehubNative && window.timehubNative.getUpdateState),' +
+          'hasSetDeviceMonitoring: typeof (window.timehubNative && window.timehubNative.setDeviceMonitoring),' +
+          'hasOnDeviceEvent: typeof (window.timehubNative && window.timehubNative.onDeviceEvent),' +
+          'hasGetRemovableDrives: typeof (window.timehubNative && window.timehubNative.getRemovableDrives),' +
+          'deviceSupported: window.timehubNative && window.timehubNative.deviceMonitoringSupported,' +
           'state: window.timehubNative ? window.timehubNative.getUpdateState() : null' +
         '})'
       );
@@ -411,6 +483,14 @@ function runSelfTest() {
       if (result.hasRestart !== 'function') return fail('restartToUpdate');
       if (result.hasGetUpdateState !== 'function') return fail('getUpdateState');
       if (!result.state || result.state.status !== 'idle') return fail('update state not idle');
+      if (result.hasSetDeviceMonitoring !== 'function') return fail('setDeviceMonitoring');
+      if (result.hasOnDeviceEvent !== 'function') return fail('onDeviceEvent');
+      if (result.hasGetRemovableDrives !== 'function') return fail('getRemovableDrives');
+      if (result.deviceSupported !== (process.platform === 'win32')) return fail('deviceMonitoringSupported');
+      // Only the main TimeHub window may switch logging on; this test window
+      // is not it, so the request must be refused and nothing may start.
+      const dev = await win.webContents.executeJavaScript('window.timehubNative.setDeviceMonitoring(true)');
+      if (!dev || dev.active !== false || deviceMonitor) return fail('device logging started from a non-main window');
       const restarted = await win.webContents.executeJavaScript('window.timehubNative.restartToUpdate()');
       if (restarted !== false) return fail('restartToUpdate should be false before a download');
       clearTimeout(timer);
@@ -444,5 +524,5 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => { isQuitting = true; });
+app.on('before-quit', () => { isQuitting = true; stopDeviceMonitoring(); });
 app.on('window-all-closed', (e) => { /* stay alive in tray */ });

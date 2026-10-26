@@ -72,6 +72,10 @@ The page sees `window.timehubNative` only inside this shell (`contextIsolation` 
 | `onUpdateReady(cb)` | `cb({ version })` when a download is ready. Replays immediately if one is already ready. Returns an unsubscribe function. |
 | `onUpdateError(cb)` | `cb({ message })` when a check or download fails. Replays if the latest status is still an error. Returns an unsubscribe function. |
 | `restartToUpdate()` | Promise. Resolves `true` when a download is staged and quit-and-install was requested. Resolves `false` in dev or before a download. A following update error means the installer did not start. |
+| `deviceMonitoringSupported` | v1.3.0+. `true` on Windows. |
+| `setDeviceMonitoring(on)` | v1.3.0+. Turns USB / Downloads logging on or off (off by default). Resolves `{ ok, active, reason? }`. Only the main TimeHub window may call it. |
+| `onDeviceEvent(cb)` | v1.3.0+. `cb(event)` per event; events that arrive before the page subscribes are held and replayed. Returns an unsubscribe function. See below. |
+| `getRemovableDrives()` | v1.3.0+. Drives being watched now: `[{ id, label, size, fs, bus }]`. |
 
 DOM events (live only; they do not replay — use the methods above after a late mount):
 
@@ -103,6 +107,19 @@ The shell does not decide whether monitoring is allowed.
 - A screenshot is taken only when the page calls `captureScreen`. The page is responsible for the company setting, the notice the person accepted, and the clocked-in state.
 - The border is shown only when the page calls `setLiveViewBorder(true)`.
 - Bytes stay on the machine until the web app uploads them with the signed-in session. This repo has no Supabase keys and no upload code.
+- USB / Downloads logging (v1.3.0) runs only after the page calls `setDeviceMonitoring(true)`. The page does that only when monitoring is enabled and the person accepted the current notice, and turns it off when that stops being true or they sign out.
+
+## USB drive and download logging (v1.3.0)
+
+`device-monitor.js`, Windows only. While switched on:
+
+- A small PowerShell loop (`timehub-drives.ps1` in the app's data folder, run with `-File`) lists removable drives (`Win32_LogicalDisk DriveType=2`) and volumes on USB-attached disks every 4 seconds. It exits by itself if TimeHub is gone.
+- Each drive is watched with `fs.watch` (recursive). A file created or written after the drive appeared is reported once its writes settle. Reading files that were already on the drive is not reported. System files (`System Volume Information`, `$RECYCLE.BIN`, `~$` lock files, `.tmp`) are skipped.
+- The person's Downloads folder is watched the same way, so a file saved by any browser or app is reported once the download finishes (`.crdownload` / `.part` files are skipped).
+
+Events: `{ kind, drive_letter, drive_label, file_name, file_ext, size_bytes, occurred_at, details }`, where `kind` is `usb_connected`, `usb_removed`, `file_copied` (written to a USB drive) or `file_downloaded`. File names, types and sizes only. The module never opens a file for reading; `npm run smoke` checks that.
+
+Known gaps: a USB drive that Windows reports as a SCSI/NVMe disk is missed, and so are phones (MTP) and network shares. Files saved somewhere other than Downloads aren't reported as downloads. Blocking USB storage is a Windows policy job; see `docs/usb-blocking.md` in the web app repo.
 
 ## Code signing
 

@@ -64,6 +64,21 @@ ipcRenderer.on('timehub:update-error', (_e, payload) => {
   notify(updateErrorListeners, detail);
 });
 
+// ----- USB / file-copy events (added v1.3.0) -----
+// Held here until the page subscribes (the app may send events before React
+// mounts), then delivered in order.
+const deviceListeners = new Set();
+const deviceBacklog = [];
+ipcRenderer.on('timehub:device-event', (_e, payload) => {
+  if (!payload || typeof payload !== 'object') return;
+  if (deviceListeners.size === 0) {
+    deviceBacklog.push(payload);
+    if (deviceBacklog.length > 1000) deviceBacklog.shift();
+    return;
+  }
+  notify(deviceListeners, payload);
+});
+
 const appVersion = readAppVersion();
 
 contextBridge.exposeInMainWorld('timehubNative', {
@@ -96,6 +111,32 @@ contextBridge.exposeInMainWorld('timehubNative', {
   // active. The web app turns it on while an admin is watching and off when the
   // session ends.
   setLiveViewBorder: (on) => ipcRenderer.invoke('timehub:live-border', !!on),
+
+  // ----- USB / removable drive logging (added v1.3.0, Windows) -----
+  // True when this build can log USB drives and files copied to them.
+  deviceMonitoringSupported: process.platform === 'win32',
+
+  // Turn logging on or off. Off by default. The web app turns it on only
+  // when monitoring is enabled and the person accepted the current notice.
+  // Resolves { ok, active, reason? }.
+  setDeviceMonitoring: (on) => ipcRenderer.invoke('timehub:device-monitoring', !!on),
+
+  // Drives currently being watched: [{ id, label, size, fs, bus }].
+  getRemovableDrives: () => ipcRenderer.invoke('timehub:removable-drives'),
+
+  // cb(event) for each event: { kind: 'usb_connected' | 'usb_removed' |
+  // 'file_copied', drive_letter, drive_label, file_name?, file_ext?,
+  // size_bytes?, occurred_at, details }. File names and sizes only, never
+  // contents. Returns an unsubscribe function.
+  onDeviceEvent: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    deviceListeners.add(cb);
+    while (deviceBacklog.length) {
+      const ev = deviceBacklog.shift();
+      try { cb(ev); } catch (_) {}
+    }
+    return () => deviceListeners.delete(cb);
+  },
 
   // ----- auto-update (shell downloads; the page may offer Restart) -----
   // Latest state. status is "idle", "ready", or "error". Subscribers below
