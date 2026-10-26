@@ -1,7 +1,7 @@
 {
   "name": "timehub-desktop",
   "productName": "TimeHub",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "TimeHub desktop (Electron wrapper for app.timehub.company) with native whole-computer idle, compliant consent-based screen monitoring, USB drive and file-copy logging, and auto-update.",
   "main": "main.js",
   "scripts": {
@@ -59,6 +59,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "shortcutName": "TimeHub",
+      "include": "build/installer.nsh",
       "artifactName": "TimeHub-Setup.${ext}"
     }
   }

@@ -74,6 +74,21 @@ if (/autoUpdater\.on\('error',\s*\(\)\s*=>\s*\{\s*\}\)/.test(main)) {
   fail('updater errors are still swallowed');
 }
 
+// Upgrades must close the running app (see build/installer.nsh).
+if (!pkg.build || !pkg.build.nsis || pkg.build.nsis.include !== "build/installer.nsh") {
+  fail("build.nsis.include should be build/installer.nsh");
+}
+{
+  const nsh = read("build/installer.nsh");
+  if (!nsh.includes("!macro customCheckAppRunning")) fail("installer.nsh must define customCheckAppRunning");
+  // nsExec does not expand %VARS%, so a command that starts with one never runs.
+  if (/nsExec::Execs+`%/.test(nsh)) fail("installer.nsh starts an nsExec command with an unexpanded %VAR%");
+  if (!nsh.includes("/F /T")) fail("installer.nsh should force-close TimeHub with its child processes");
+}
+for (const token of ["--timehub-quit", "quitForInstaller()"]) {
+  if (!main.includes(token)) fail("main.js is missing " + token);
+}
+
 const release = read('.github/workflows/release.yml');
 if (!release.includes('npm run publish')) fail('release.yml no longer publishes');
 if (!release.includes('"v*"')) fail('release.yml no longer triggers on v* tags');

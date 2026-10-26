@@ -1,6 +1,6 @@
 # TimeHub Desktop
 
-Windows shell for [https://app.timehub.company](https://app.timehub.company). Version **1.2.1** (`package.json`). The web app owns sign-in, consent, billing, and product logic. This repo is the Electron window, tray, native idle signal, consent-gated screen-capture IPC, and auto-update. It does not contain the web app.
+Windows shell for [https://app.timehub.company](https://app.timehub.company). Version **1.3.1** (`package.json`). The web app owns sign-in, consent, billing, and product logic. This repo is the Electron window, tray, native idle signal, consent-gated screen-capture IPC, and auto-update. It does not contain the web app.
 
 ## Install
 
@@ -42,6 +42,8 @@ On a packaged build, the first launch that was **not** itself started by the log
 That first-launch path runs again on later manual starts. Unchecking the tray item applies immediately, and a later manual start turns it back on. IT does not need a logon script or a Run-key deployment for the default “open at login” behavior.
 
 Closing the window hides it to the tray. Quit is on the tray menu. A second launch focuses the existing window.
+
+Installing over a running copy closes it automatically ([`build/installer.nsh`](build/installer.nsh)). The installer runs `TimeHub.exe --timehub-quit`, which tells the running copy (1.3.1+) to quit cleanly through the single-instance lock. After 5 seconds it runs `taskkill /F /T` on this user's `TimeHub.exe` processes. It shows "TimeHub cannot be closed … Retry" only if that also fails, for example when TimeHub was started as administrator. electron-builder 24's own check is replaced because it never ran for per-user installs: it starts its `tasklist` command with `%SYSTEMROOT%`, which `nsExec` does not expand.
 
 ## Auto-update
 

@@ -57,12 +57,42 @@ ipcMain.on('timehub:get-version', (event) => {
 
 ipcMain.handle('timehub:restart-to-update', () => installDownloadedUpdate());
 
+// The installer runs `TimeHub.exe --timehub-quit` before an upgrade or
+// uninstall. The new process hands the flag to the running copy through the
+// single-instance lock below and exits; the running copy then quits cleanly.
+const QUIT_FLAG = '--timehub-quit';
+const QUIT_FALLBACK_MS = 3000;
+const isQuitRequest = (argv) => Array.isArray(argv) && argv.indexOf(QUIT_FLAG) !== -1;
+
+// Quit for good: no hide-to-tray, no helper processes left behind, and no
+// pending update install kicked off on the way out (an installer is already
+// running, and a second one would collide with it).
+function quitForInstaller() {
+  isQuitting = true;
+  if (autoUpdater) {
+    try { autoUpdater.autoInstallOnAppQuit = false; } catch (_) {}
+  }
+  stopDeviceMonitoring();
+  if (tray) { try { tray.destroy(); } catch (_) {} tray = null; }
+  app.quit();
+  // If a window or handler still blocks the quit, exit anyway; the installer
+  // force-closes TimeHub a few seconds later regardless.
+  setTimeout(() => app.exit(0), QUIT_FALLBACK_MS).unref();
+}
+
 // --- Single instance: focus the existing window instead of opening a 2nd one ---
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
+} else if (isQuitRequest(process.argv)) {
+  // Nothing was running: a quit request must never start TimeHub.
+  app.exit(0);
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
+    if (isQuitRequest(argv)) {
+      quitForInstaller();
+      return;
+    }
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
