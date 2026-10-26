@@ -124,7 +124,9 @@ function powershellDriveSource(scriptDir) {
           fs.writeFileSync(file, powershellScript(process.pid), 'utf8');
           child = spawn('powershell.exe',
             ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file],
-            { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+            // cwd: the data folder, never the install folder, so this helper
+            // cannot hold the install folder open during an upgrade.
+            { cwd: dir, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
         } catch (err) {
           if (onError) onError(err);
           restartTimer = setTimeout(launch, 30000);
