@@ -282,7 +282,11 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // Keep the 30 s heartbeat on time while the window is hidden in the
+      // tray. Chromium otherwise slows hidden pages' timers to once a minute,
+      // which made people look offline or "last seen" late.
+      backgroundThrottling: false
     }
   });
 
@@ -372,26 +376,42 @@ function createTray() {
 // Report the machine's idle time to the web app every few seconds. The web app
 // reads window.timehubNative (see preload.js) and uses this as the source of
 // truth for idle breaks when running inside the desktop app.
+//
+// Each report carries the real seconds since the last keyboard/mouse input
+// and locked=true while the screen is locked or the computer is asleep. The
+// web app counts a locked screen as idle straight away. (Before 1.3.3 a lock
+// sent idleSeconds 99999, then the next 5 s tick sent the small real number,
+// so a locked PC showed "active" for the first minute and the server could
+// start the idle period hours too early.)
+function isLockedNow() {
+  if (screenLocked) return true;
+  try { return powerMonitor.getSystemIdleState(1) === 'locked'; } catch (_) { return false; }
+}
+
+function sendIdle(source) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  let idleSeconds = 0;
+  try { idleSeconds = powerMonitor.getSystemIdleTime(); } catch (_) {}
+  mainWindow.webContents.send('timehub:idle', { idleSeconds, locked: isLockedNow(), source });
+}
+
 function startIdleReporting() {
-  const tick = () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    let idleSeconds = 0;
-    try { idleSeconds = powerMonitor.getSystemIdleTime(); } catch (_) {}
-    mainWindow.webContents.send('timehub:idle', { idleSeconds, source: 'powerMonitor' });
-  };
+  const tick = () => sendIdle('powerMonitor');
   setInterval(tick, IDLE_POLL_MS);
   tick();
 
   ['lock-screen', 'suspend'].forEach((ev) =>
     powerMonitor.on(ev, () => {
       screenLocked = true;
-      if (mainWindow) mainWindow.webContents.send('timehub:idle', { idleSeconds: 99999, source: ev });
+      sendIdle(ev);
       if (ev === 'lock-screen') maybeAutoInstall('screen locked');
     }));
   ['unlock-screen', 'resume'].forEach((ev) =>
     powerMonitor.on(ev, () => {
       screenLocked = false;
-      if (mainWindow) mainWindow.webContents.send('timehub:idle', { idleSeconds: 0, source: ev });
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('timehub:idle', { idleSeconds: 0, locked: false, source: ev });
+      }
       // Back from sleep: if we were on the reconnect screen, try straight away.
       if (showingOffline) loadApp();
     }));
