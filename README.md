@@ -50,10 +50,15 @@ Installing over a running copy closes it automatically ([`build/installer.nsh`](
 Packaged builds only. `npm start` does not check.
 
 - Provider: GitHub Releases for `jic52194/timehub-desktop` (electron-updater).
-- On startup, then every 6 hours, the shell reads `latest.yml` from the latest release and downloads in the background.
-- The download installs on the next quit (`autoInstallOnAppQuit`). The tray tooltip says when an update is ready, and the menu gains **Restart to update** (silent install, then relaunch).
+- On startup, then every hour, the shell reads `latest.yml` from the latest release and downloads in the background.
+- The download installs by itself once the screen is locked or the computer has been idle for 10 minutes (silent install, then relaunch), or on the next quit (`autoInstallOnAppQuit`). The tray tooltip says when an update is ready, and the menu gains **Restart to update** (silent install, then relaunch).
 - Failures are no longer dropped. The shell appends them to `updater.log` in the app user-data directory (`%APPDATA%\timehub-desktop\updater.log` on Windows), sets the tray tooltip, and tells the page (see below). Query strings and GitHub token-shaped strings are stripped from the message that reaches the page.
 - A later successful “no update” clears an error tooltip. If a download is already staged, a failed re-check leaves the tooltip on “update ready”.
+
+### Staying up (1.3.2+)
+
+- If TimeHub can't be reached (no internet, DNS, server error 5xx), the window shows a "Reconnecting to TimeHub" screen instead of a blank page and retries after 5 s, doubling to at most 60 s. It also retries at once when the network comes back or the computer wakes.
+- A crashed page reloads itself; a page frozen for 30 s is reloaded.
 
 Publish a release by bumping `package.json` and pushing a tag that matches it (`v1.2.1` for version `1.2.1`). [`.github/workflows/release.yml`](.github/workflows/release.yml) builds `TimeHub-Setup.exe` and `latest.yml` with `GITHUB_TOKEN`. `workflow_dispatch` publishes whatever version is on the branch you run it from. Pull-request CI builds the installer with `--publish never` and does not create a release.
 

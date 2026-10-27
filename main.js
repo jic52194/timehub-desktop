@@ -25,8 +25,17 @@ const { DeviceMonitor } = require('./device-monitor');
 
 const APP_URL = process.env.TIMEHUB_URL || 'https://app.timehub.company';
 const IDLE_POLL_MS = 5000; // how often we report machine idle time to the web app
-const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000; // re-check for updates every 6 hours
+const UPDATE_CHECK_MS = 60 * 60 * 1000; // re-check for updates every hour
 const UPDATER_LOG_MAX_BYTES = 256 * 1024;
+// A downloaded update installs itself once the computer has been idle this
+// long, or the screen is locked, so nobody has to quit TimeHub to update.
+const AUTO_INSTALL_IDLE_S = 10 * 60;
+const AUTO_INSTALL_POLL_MS = 60 * 1000;
+// Reconnect screen: retry after 5 s, then back off to at most 60 s.
+const RETRY_MIN_S = 5;
+const RETRY_MAX_S = 60;
+// A frozen page is reloaded after this long.
+const UNRESPONSIVE_RELOAD_MS = 30 * 1000;
 
 let mainWindow = null;
 let tray = null;
@@ -36,6 +45,12 @@ let autoUpdater = null;
 let updateDownloaded = false;
 let pageReady = false;
 let pendingUpdate = null; // latest { channel, payload } to replay after a full load
+let screenLocked = false;
+let autoInstallTimer = null;
+let offlineAttempt = 0; // consecutive failed loads of the web app
+let showingOffline = false;
+let offlineResetTimer = null;
+let unresponsiveTimer = null;
 let deviceMonitor = null; // USB / file-copy logging, on only while the web app asks
 const deviceQueue = []; // device events held while the page is (re)loading
 const DEVICE_QUEUE_MAX = 1000;
@@ -210,6 +225,49 @@ function refreshTrayMenu() {
   tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
+function isAppUrl(url) {
+  return typeof url === 'string' && url.startsWith(APP_URL);
+}
+
+function loadApp() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.loadURL(APP_URL).catch(() => {}); } catch (_) {}
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Local "reconnecting" screen. Counts down, then goes back to TimeHub; another
+// failure brings it back with a longer wait (5 s doubling up to 60 s).
+function showOffline(reason) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  pageReady = false;
+  showingOffline = true;
+  clearTimeout(offlineResetTimer);
+  offlineAttempt += 1;
+  const wait = Math.min(RETRY_MAX_S, RETRY_MIN_S * Math.pow(2, Math.max(0, offlineAttempt - 1)));
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"><title>TimeHub</title><style>' +
+    'html,body{margin:0;height:100%;background:#0f1115;color:#e5e7eb;font:15px system-ui,Segoe UI,sans-serif}' +
+    '.c{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px}' +
+    'h1{font-size:20px;margin:0;color:#fff}p{margin:0;color:#9ca3af;max-width:440px}' +
+    'button{margin-top:8px;background:#F47B20;color:#fff;border:0;border-radius:10px;padding:10px 22px;font:600 15px system-ui;cursor:pointer}' +
+    '.r{font-size:12px;color:#6b7280}</style></head><body><div class="c">' +
+    '<h1>Reconnecting to TimeHub…</h1>' +
+    '<p>TimeHub can\'t reach the internet right now. Your clock and shift are safe; this window reconnects by itself.</p>' +
+    '<p id="n">Trying again in ' + wait + ' s</p>' +
+    '<button onclick="go()">Try now</button>' +
+    '<p class="r">' + escapeHtml(reason) + '</p></div><script>' +
+    'var s=' + wait + ';function go(){location.replace(' + JSON.stringify(APP_URL) + ');}' +
+    'setInterval(function(){s--;if(s<=0){go();}else{document.getElementById("n").textContent="Trying again in "+s+" s";}},1000);' +
+    'window.addEventListener("online",go);' +
+    '</script></body></html>';
+  try {
+    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html)).catch(() => {});
+  } catch (_) {}
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -230,12 +288,51 @@ function createWindow() {
 
   mainWindow.webContents.on('did-start-loading', () => { pageReady = false; });
   mainWindow.webContents.on('did-finish-load', () => {
+    // The reconnect screen is not the web app: nothing listens there.
+    if (!isAppUrl(mainWindow.webContents.getURL())) {
+      showingOffline = true;
+      return;
+    }
+    showingOffline = false;
+    // A failed load also "finishes" (Chromium's error page), so only reset
+    // the back-off once TimeHub has stayed up for a while.
+    clearTimeout(offlineResetTimer);
+    offlineResetTimer = setTimeout(() => { if (!showingOffline) offlineAttempt = 0; }, 15000);
     pageReady = true;
     if (pendingUpdate) sendToRenderer(pendingUpdate.channel, pendingUpdate.payload);
     flushDeviceQueue();
   });
 
-  mainWindow.loadURL(APP_URL);
+  // No internet, DNS trouble, or TimeHub down: show the reconnect screen
+  // instead of a blank window, and keep retrying.
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // -3 = aborted by a newer navigation
+    logUpdater('info', 'page load failed ' + code + ' ' + desc);
+    showOffline(desc);
+  });
+  mainWindow.webContents.on('did-navigate', (_e, url, httpCode) => {
+    if (isAppUrl(url) && httpCode >= 500) {
+      logUpdater('info', 'server error ' + httpCode);
+      showOffline('TimeHub server error ' + httpCode);
+    }
+  });
+
+  // Crashed or frozen page: reload it.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    logUpdater('error', 'page process gone: ' + (details && details.reason));
+    setTimeout(() => loadApp(), 1000);
+  });
+  mainWindow.on('unresponsive', () => {
+    clearTimeout(unresponsiveTimer);
+    unresponsiveTimer = setTimeout(() => {
+      logUpdater('error', 'page unresponsive, reloading');
+      try { mainWindow.webContents.forcefullyCrashRenderer(); } catch (_) {}
+      loadApp();
+    }, UNRESPONSIVE_RELOAD_MS);
+  });
+  mainWindow.on('responsive', () => clearTimeout(unresponsiveTimer));
+
+  loadApp();
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
@@ -286,9 +383,18 @@ function startIdleReporting() {
   tick();
 
   ['lock-screen', 'suspend'].forEach((ev) =>
-    powerMonitor.on(ev, () => mainWindow && mainWindow.webContents.send('timehub:idle', { idleSeconds: 99999, source: ev })));
+    powerMonitor.on(ev, () => {
+      screenLocked = true;
+      if (mainWindow) mainWindow.webContents.send('timehub:idle', { idleSeconds: 99999, source: ev });
+      if (ev === 'lock-screen') maybeAutoInstall('screen locked');
+    }));
   ['unlock-screen', 'resume'].forEach((ev) =>
-    powerMonitor.on(ev, () => mainWindow && mainWindow.webContents.send('timehub:idle', { idleSeconds: 0, source: ev })));
+    powerMonitor.on(ev, () => {
+      screenLocked = false;
+      if (mainWindow) mainWindow.webContents.send('timehub:idle', { idleSeconds: 0, source: ev });
+      // Back from sleep: if we were on the reconnect screen, try straight away.
+      if (showingOffline) loadApp();
+    }));
 }
 
 // --- Screen monitoring: single-frame capture on request from the web app ------
@@ -428,6 +534,20 @@ function checkForUpdates(notify) {
   }
 }
 
+// Install a downloaded update when the screen is locked or the computer has
+// been idle 10+ minutes. Silent; TimeHub restarts itself (hidden in the tray
+// if the window was hidden). The person's clock-in lives on the server, so a
+// restart never loses it.
+function maybeAutoInstall(why) {
+  if (!updateDownloaded || isQuitting) return;
+  let idle = 0;
+  try { idle = powerMonitor.getSystemIdleTime(); } catch (_) {}
+  if (!screenLocked && idle < AUTO_INSTALL_IDLE_S) return;
+  logUpdater('info', 'auto-installing update (' + why + ', idle ' + idle + ' s)');
+  if (autoInstallTimer) { clearInterval(autoInstallTimer); autoInstallTimer = null; }
+  installDownloadedUpdate();
+}
+
 function setupAutoUpdate() {
   if (!app.isPackaged) return;
   try {
@@ -454,9 +574,13 @@ function setupAutoUpdate() {
     updateDownloaded = true;
     const version = info && info.version ? String(info.version) : null;
     logUpdater('info', 'update downloaded' + (version ? ' ' + version : ''));
-    setTrayTip('TimeHub — update ready (installs on quit)');
+    setTrayTip('TimeHub — update ready (installs when the computer is idle)');
     publishUpdate('timehub:update-ready', { version: version });
     refreshTrayMenu();
+    // Install by itself when nobody is using the computer.
+    if (!autoInstallTimer) {
+      autoInstallTimer = setInterval(() => maybeAutoInstall('idle'), AUTO_INSTALL_POLL_MS);
+    }
   });
   autoUpdater.on('error', (err) => reportUpdateError(err));
   checkForUpdates(false);
