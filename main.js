@@ -31,6 +31,9 @@ const UPDATER_LOG_MAX_BYTES = 256 * 1024;
 // long, or the screen is locked, so nobody has to quit TimeHub to update.
 const AUTO_INSTALL_IDLE_S = 10 * 60;
 const AUTO_INSTALL_POLL_MS = 60 * 1000;
+// Local hours when an update may install by itself (05:00 to 16:00).
+const INSTALL_FROM_HOUR = 5;
+const INSTALL_UNTIL_HOUR = 16;
 // Reconnect screen: retry after 5 s, then back off to at most 60 s.
 const RETRY_MIN_S = 5;
 const RETRY_MAX_S = 60;
@@ -225,6 +228,33 @@ function refreshTrayMenu() {
   tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
+// --- Blank-page watchdog ---------------------------------------------------
+// If the window is visible on TimeHub but the page has drawn nothing for two
+// checks in a row, reload it (at most once every 2 minutes). Covers a page
+// that reloaded while hidden and never painted, or a script that failed.
+const BLANK_CHECK_MS = 30 * 1000;
+let blankStrikes = 0;
+let lastBlankReload = 0;
+async function checkNotBlank(why) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible() || showingOffline) return;
+  const wc = mainWindow.webContents;
+  if (wc.isLoading() || !isAppUrl(wc.getURL())) return;
+  let chars = -1;
+  try {
+    chars = await wc.executeJavaScript(
+      "(function(){var r=document.getElementById('root');return r?(r.innerText||'').trim().length:0;})()",
+      true);
+  } catch (_) { chars = 0; }
+  if (chars > 0) { blankStrikes = 0; return; }
+  blankStrikes += 1;
+  try { wc.invalidate(); } catch (_) {}
+  if (blankStrikes < 2 || Date.now() - lastBlankReload < 2 * 60 * 1000) return;
+  blankStrikes = 0;
+  lastBlankReload = Date.now();
+  logUpdater('error', 'page was blank (' + why + '), reloading');
+  try { wc.reloadIgnoringCache(); } catch (_) { loadApp(); }
+}
+
 function isAppUrl(url) {
   return typeof url === 'string' && url.startsWith(APP_URL);
 }
@@ -282,11 +312,11 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false,
-      // Keep the 30 s heartbeat on time while the window is hidden in the
-      // tray. Chromium otherwise slows hidden pages' timers to once a minute,
-      // which made people look offline or "last seen" late.
-      backgroundThrottling: false
+      nodeIntegration: false
+      // backgroundThrottling stays at Chromium's default. 1.3.3 turned it off
+      // to keep the heartbeat on time in the tray, and some PCs then showed a
+      // blank window after the page reloaded while hidden. Hidden pages still
+      // check in about once a minute, inside the 2-minute offline limit.
     }
   });
 
@@ -339,6 +369,15 @@ function createWindow() {
   loadApp();
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
+
+  // Whenever the window comes back (tray, taskbar, second launch), make
+  // Chromium paint it again, then make sure the page actually has content.
+  ['show', 'restore', 'focus'].forEach((ev) =>
+    mainWindow.on(ev, () => {
+      try { mainWindow.webContents.invalidate(); } catch (_) {}
+      setTimeout(() => checkNotBlank(ev), 4000);
+    }));
+  setInterval(() => checkNotBlank('timer'), BLANK_CHECK_MS);
 
   // Open external links (anything not on timehub.company) in the system browser.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -558,8 +597,16 @@ function checkForUpdates(notify) {
 // been idle 10+ minutes. Silent; TimeHub restarts itself (hidden in the tray
 // if the window was hidden). The person's clock-in lives on the server, so a
 // restart never loses it.
+function inInstallWindow(d = new Date()) {
+  const h = d.getHours();
+  return h >= INSTALL_FROM_HOUR && h < INSTALL_UNTIL_HOUR;
+}
+
 function maybeAutoInstall(why) {
   if (!updateDownloaded || isQuitting) return;
+  // Never restart TimeHub during working hours; it installs on the next quit
+  // or during the quiet window.
+  if (!inInstallWindow()) return;
   let idle = 0;
   try { idle = powerMonitor.getSystemIdleTime(); } catch (_) {}
   if (!screenLocked && idle < AUTO_INSTALL_IDLE_S) return;
@@ -594,7 +641,7 @@ function setupAutoUpdate() {
     updateDownloaded = true;
     const version = info && info.version ? String(info.version) : null;
     logUpdater('info', 'update downloaded' + (version ? ' ' + version : ''));
-    setTrayTip('TimeHub — update ready (installs when the computer is idle)');
+    setTrayTip('TimeHub — update ready (installs outside working hours)');
     publishUpdate('timehub:update-ready', { version: version });
     refreshTrayMenu();
     // Install by itself when nobody is using the computer.
