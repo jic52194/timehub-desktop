@@ -18,7 +18,7 @@
 // TODO(crash-reporting): nothing is wired. A vendor such as Sentry can be
 // initialized here later from an env DSN. Do not commit a DSN or a half-configured SDK.
 
-const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, powerMonitor, shell, nativeImage, ipcMain, desktopCapturer, screen, net } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { DeviceMonitor } = require('./device-monitor');
@@ -53,6 +53,7 @@ let autoInstallTimer = null;
 let offlineAttempt = 0; // consecutive failed loads of the web app
 let showingOffline = false;
 let offlineResetTimer = null;
+let quickReloads = 0; // reloads tried while TimeHub was reachable, before showing the reconnect screen
 let unresponsiveTimer = null;
 let deviceMonitor = null; // USB / file-copy logging, on only while the web app asks
 const deviceQueue = []; // device events held while the page is (re)loading
@@ -270,7 +271,7 @@ function escapeHtml(s) {
 
 // Local "reconnecting" screen. Counts down, then goes back to TimeHub; another
 // failure brings it back with a longer wait (5 s doubling up to 60 s).
-function showOffline(reason) {
+function showOffline(reason, reachable) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   pageReady = false;
   showingOffline = true;
@@ -279,13 +280,16 @@ function showOffline(reason) {
   const wait = Math.min(RETRY_MAX_S, RETRY_MIN_S * Math.pow(2, Math.max(0, offlineAttempt - 1)));
   const html =
     '<!doctype html><html><head><meta charset="utf-8"><title>TimeHub</title><style>' +
-    'html,body{margin:0;height:100%;background:#0f1115;color:#e5e7eb;font:15px system-ui,Segoe UI,sans-serif}' +
+    '*{box-sizing:border-box}html,body{margin:0;overflow:hidden;height:100%;background:#0f1115;color:#e5e7eb;font:15px system-ui,Segoe UI,sans-serif}' +
     '.c{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px}' +
     'h1{font-size:20px;margin:0;color:#fff}p{margin:0;color:#9ca3af;max-width:440px}' +
     'button{margin-top:8px;background:#F47B20;color:#fff;border:0;border-radius:10px;padding:10px 22px;font:600 15px system-ui;cursor:pointer}' +
     '.r{font-size:12px;color:#6b7280}</style></head><body><div class="c">' +
-    '<h1>Reconnecting to TimeHub…</h1>' +
-    '<p>TimeHub can\'t reach the internet right now. Your clock and shift are safe; this window reconnects by itself.</p>' +
+    '<h1>' + (reachable ? 'TimeHub didn\'t finish loading' : 'Reconnecting to TimeHub…') + '</h1>' +
+    '<p>' + (reachable
+      ? 'Your internet is working, but the page stopped loading part-way.'
+      : 'TimeHub can\'t reach the internet right now.') +
+    ' Your clock and shift are safe; this window tries again by itself.</p>' +
     '<p id="n">Trying again in ' + wait + ' s</p>' +
     '<button onclick="go()">Try now</button>' +
     '<p class="r">' + escapeHtml(reason) + '</p></div><script>' +
@@ -296,6 +300,59 @@ function showOffline(reason) {
   try {
     mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html)).catch(() => {});
   } catch (_) {}
+}
+
+// Can this PC reach TimeHub right now? Gives up after 8 s.
+async function timehubReachable() {
+  try {
+    const res = await Promise.race([
+      net.fetch(APP_URL, { method: 'HEAD', cache: 'no-store' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
+    ]);
+    return res.status < 500;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function pageHasContent() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const wc = mainWindow.webContents;
+  if (!isAppUrl(wc.getURL())) return false;
+  try {
+    const chars = await wc.executeJavaScript(
+      "(function(){var r=document.getElementById('root');return r?(r.innerText||'').trim().length:0;})()",
+      true);
+    return chars > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// A load failed. Electron gives an empty description when TimeHub's page had
+// already arrived and then failed part-way (for example a dropped request
+// after sleep or a network switch). That is not "no internet", so:
+//  1. if the page is showing TimeHub, keep it;
+//  2. if TimeHub answers, reload (twice at most) instead of the reconnect screen;
+//  3. otherwise show the reconnect screen with the real error.
+async function handleLoadFailure(code, desc, url) {
+  const reason = (desc || 'load interrupted') + ' (' + code + ')';
+  logUpdater('info', 'page load failed ' + reason + ' ' + (url || ''));
+  if (!desc) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (await pageHasContent()) {
+      logUpdater('info', 'page is showing, keeping it');
+      return;
+    }
+  }
+  const reachable = await timehubReachable();
+  if (reachable && quickReloads < 2) {
+    quickReloads += 1;
+    logUpdater('info', 'TimeHub is reachable, reloading (try ' + quickReloads + ')');
+    setTimeout(() => loadApp(), 1500);
+    return;
+  }
+  showOffline(reason, reachable);
 }
 
 function createWindow() {
@@ -331,7 +388,7 @@ function createWindow() {
     // A failed load also "finishes" (Chromium's error page), so only reset
     // the back-off once TimeHub has stayed up for a while.
     clearTimeout(offlineResetTimer);
-    offlineResetTimer = setTimeout(() => { if (!showingOffline) offlineAttempt = 0; }, 15000);
+    offlineResetTimer = setTimeout(() => { if (!showingOffline) { offlineAttempt = 0; quickReloads = 0; } }, 15000);
     pageReady = true;
     if (pendingUpdate) sendToRenderer(pendingUpdate.channel, pendingUpdate.payload);
     flushDeviceQueue();
@@ -341,13 +398,12 @@ function createWindow() {
   // instead of a blank window, and keep retrying.
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
     if (!isMainFrame || code === -3) return; // -3 = aborted by a newer navigation
-    logUpdater('info', 'page load failed ' + code + ' ' + desc);
-    showOffline(desc);
+    handleLoadFailure(code, desc, url);
   });
   mainWindow.webContents.on('did-navigate', (_e, url, httpCode) => {
     if (isAppUrl(url) && httpCode >= 500) {
       logUpdater('info', 'server error ' + httpCode);
-      showOffline('TimeHub server error ' + httpCode);
+      showOffline('TimeHub server error ' + httpCode, true);
     }
   });
 
